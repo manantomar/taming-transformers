@@ -107,6 +107,248 @@ class VectorQuantizer(nn.Module):
         return z_q
 
 
+class RecurrentVectorQuantizer(nn.Module):
+    """
+    see https://github.com/MishaLaskin/vqvae/blob/d761a999e2267766400dc646d82d3ac3657771d4/models/quantizer.py
+    ____________________________________________
+    Discretization bottleneck part of the VQ-VAE.
+    Inputs:
+    - n_e : number of embeddings
+    - e_dim : dimension of embedding
+    - beta : commitment cost used in loss term, beta * ||z_e(x)-sg[e]||^2
+    _____________________________________________
+    """
+
+    # NOTE: this class contains a bug regarding beta; see VectorQuantizer2 for
+    # a fix and use legacy=False to apply that fix. VectorQuantizer2 can be
+    # used wherever VectorQuantizer has been used before and is additionally
+    # more efficient.
+    def __init__(self, n_e, e_dim, beta):
+        super(RecurrentVectorQuantizer, self).__init__()
+        self.n_e = n_e
+        self.e_dim = e_dim
+        self.beta = beta
+
+        self.embedding = nn.Embedding(self.n_e, self.e_dim)
+        self.embedding.weight.data.uniform_(-1.0 / self.n_e, 1.0 / self.n_e)
+
+    def forward(self, z):
+        """
+        Inputs the output of the encoder network z and maps it to a discrete
+        one-hot vector that is the index of the closest embedding vector e_j
+        z (continuous) -> z_q (discrete)
+        z.shape = (batch, channel, height, width)
+        quantization pipeline:
+            1. get encoder input (B,C,H,W)
+            2. flatten input to (B*H*W,C)
+        """
+        # reshape z -> (batch, height, width, channel) and flatten
+        # z = z.permute(0, 2, 3, 1).contiguous()
+        z = z.contiguous()
+        z_flattened = z.view(-1, self.e_dim)
+        # distances from z to embeddings e_j (z - e)^2 = z^2 + e^2 - 2 e * z
+
+        d = torch.sum(z_flattened ** 2, dim=1, keepdim=True) + \
+            torch.sum(self.embedding.weight**2, dim=1) - 2 * \
+            torch.matmul(z_flattened, self.embedding.weight.t())
+
+        ## could possible replace this here
+        # #\start...
+        # find closest encodings
+        min_encoding_indices = torch.argmin(d, dim=1) #.unsqueeze(1)
+
+        # get second closest embeddings
+        _, min_second_encoding_indices = torch.topk(d, 2, dim=1, largest=False)
+        min_second_encoding_indices = min_second_encoding_indices[:, 1] #.unsqueeze(1)
+
+        # for all closest embeddings indices with value n-1, add the second closest index
+        min_encoding_indices_clone = min_encoding_indices.clone()  # To avoid modifying the original tensor
+        min_encoding_indices_clone[min_encoding_indices == self.n_e-1] = min_second_encoding_indices[min_encoding_indices == self.n_e-1]
+
+        # concat the two indices vectors
+        min_encoding_indices = torch.concat([min_encoding_indices.unsqueeze(1), min_encoding_indices_clone.unsqueeze(1)], dim=1).view(-1, 1)
+
+        min_encodings = torch.zeros(
+            min_encoding_indices.shape[0], self.n_e).to(z)
+        min_encodings.scatter_(1, min_encoding_indices, 1)
+
+        # dtype min encodings: torch.float32
+        # min_encodings shape: torch.Size([2048, 512])
+        # min_encoding_indices.shape: torch.Size([2048, 1])
+
+        # get quantized latent vectors
+        z_q = torch.matmul(min_encodings, self.embedding.weight).view((2 * z.shape[0], z.shape[1]))
+        #.........\end
+
+        # with:
+        # .........\start
+        #min_encoding_indices = torch.argmin(d, dim=1)
+        #z_q = self.embedding(min_encoding_indices)
+        # ......\end......... (TODO)
+
+        z = torch.concat([z.unsqueeze(1), z.unsqueeze(1)], dim=1).view(-1, z.shape[1])
+
+        # compute loss for embedding
+        loss = torch.mean((z_q.detach()-z)**2) + self.beta * \
+            torch.mean((z_q - z.detach()) ** 2)
+
+        # preserve gradients
+        z_q = z + (z_q - z).detach()
+
+        # perplexity
+        e_mean = torch.mean(min_encodings, dim=0)
+        perplexity = torch.exp(-torch.sum(e_mean * torch.log(e_mean + 1e-10)))
+
+        # reshape back to match original input shape
+        # z_q = z_q.permute(0, 3, 1, 2).contiguous()
+        z_q = z_q.contiguous()
+
+        return z_q, loss, (perplexity, min_encodings, min_encoding_indices)
+
+    def get_codebook_entry(self, indices, shape):
+        # shape specifying (batch, height, width, channel)
+        # TODO: check for more easy handling with nn.Embedding
+        min_encodings = torch.zeros(indices.shape[0], self.n_e).to(indices)
+        min_encodings.scatter_(1, indices[:,None], 1)
+
+        # get quantized latent vectors
+        z_q = torch.matmul(min_encodings.float(), self.embedding.weight)
+
+        if shape is not None:
+            z_q = z_q.view(shape)
+
+            # reshape back to match original input shape
+            z_q = z_q.permute(0, 3, 1, 2).contiguous()
+
+        return z_q
+
+
+class LoopyVectorQuantizer(nn.Module):
+    """
+    see https://github.com/MishaLaskin/vqvae/blob/d761a999e2267766400dc646d82d3ac3657771d4/models/quantizer.py
+    ____________________________________________
+    Discretization bottleneck part of the VQ-VAE.
+    Inputs:
+    - n_e : number of embeddings
+    - e_dim : dimension of embedding
+    - beta : commitment cost used in loss term, beta * ||z_e(x)-sg[e]||^2
+    _____________________________________________
+    """
+
+    # NOTE: this class contains a bug regarding beta; see VectorQuantizer2 for
+    # a fix and use legacy=False to apply that fix. VectorQuantizer2 can be
+    # used wherever VectorQuantizer has been used before and is additionally
+    # more efficient.
+    def __init__(self, n_e, e_dim, beta):
+        super(LoopyVectorQuantizer, self).__init__()
+        self.n_e = n_e
+        self.e_dim = e_dim
+        self.beta = beta
+
+        self.alpha = 0.01
+        self.gamma = 0.5
+
+        self.embedding = nn.Embedding(self.n_e, self.e_dim)
+        self.embedding.weight.data.uniform_(-1.0 / self.n_e, 1.0 / self.n_e)
+
+    def forward(self, z):
+        """
+        Inputs the output of the encoder network z and maps it to a discrete
+        one-hot vector that is the index of the closest embedding vector e_j
+        z (continuous) -> z_q (discrete)
+        z.shape = (batch, channel, height, width)
+        quantization pipeline:
+            1. get encoder input (B,C,H,W)
+            2. flatten input to (B*H*W,C)
+        """
+        # reshape z -> (batch, height, width, channel) and flatten
+        # z = z.permute(0, 2, 3, 1).contiguous()
+        z = z.contiguous()
+        z_flattened = z.view(-1, self.e_dim)
+        if_dummy_encoding = torch.zeros(z_flattened.shape[0], dtype=torch.bool)
+        
+        z_qs = []
+        # loop starts here
+        for n in range(5): # hardcoded to run for a finite no. of iterations
+            # distances from z to embeddings e_j (z - e)^2 = z^2 + e^2 - 2 e * z
+            d = torch.sum(z_flattened ** 2, dim=1, keepdim=True) + \
+                torch.sum(self.embedding.weight[1:-1]**2, dim=1) - 2 * \
+                torch.matmul(z_flattened, self.embedding.weight[1:-1].t())
+
+            # find closest encodings
+            org_min_encoding_indices = torch.argmin(d, dim=1).unsqueeze(1)
+            min_encoding_indices = org_min_encoding_indices.clone()
+
+            min_d = d[torch.arange(d.shape[0]), org_min_encoding_indices.squeeze()]
+
+            # if already mapped to a codebook vector, map to first vector
+            min_encoding_indices[if_dummy_encoding] = 0
+
+            # If not within threshold, vectors get mapped to last vector
+            min_encoding_indices[min_d >= self.alpha] = self.n_e - 1
+
+            min_encodings = torch.zeros(
+                min_encoding_indices.shape[0], self.n_e).to(z)
+            min_encodings.scatter_(1, min_encoding_indices, 1)
+
+            # get quantized latent vectors
+            z_q = torch.matmul(min_encodings, self.embedding.weight)
+            
+            org_min_encodings = torch.zeros(
+                org_min_encoding_indices.shape[0], self.n_e).to(z)
+            org_min_encodings.scatter_(1, org_min_encoding_indices, 1)
+
+            # get quantized latent vectors
+            org_z_q = torch.matmul(org_min_encodings, self.embedding.weight)
+
+            # update if any vectors got precisely mapped to codebook vectors
+            if_dummy_encoding[min_d < self.alpha] = True
+
+            # update z to be closer for next iteration of loop
+            z[~if_dummy_encoding] = self.gamma * z[~if_dummy_encoding] + (1 - self.gamma) * org_z_q[~if_dummy_encoding]
+            z_flattened = z
+
+            z_q = z_q.view(z.shape)
+            z_qs.append(min_encoding_indices.squeeze())
+
+        print("z_qs are", z_qs)
+        ## TODO: repeat z as many times as the len of z_qs to compute the loss below
+
+        # compute loss for embedding
+        loss = torch.mean((z_q.detach()-z)**2) + self.beta * \
+            torch.mean((z_q - z.detach()) ** 2)
+
+        # preserve gradients
+        z_q = z + (z_q - z).detach()
+
+        # perplexity
+        e_mean = torch.mean(min_encodings, dim=0)
+        perplexity = torch.exp(-torch.sum(e_mean * torch.log(e_mean + 1e-10)))
+
+        # reshape back to match original input shape
+        # z_q = z_q.permute(0, 3, 1, 2).contiguous()
+        z_q = z_q.contiguous()
+
+        return z_q, loss, (perplexity, min_encodings, min_encoding_indices)
+
+    def get_codebook_entry(self, indices, shape):
+        # shape specifying (batch, height, width, channel)
+        # TODO: check for more easy handling with nn.Embedding
+        min_encodings = torch.zeros(indices.shape[0], self.n_e).to(indices)
+        min_encodings.scatter_(1, indices[:,None], 1)
+
+        # get quantized latent vectors
+        z_q = torch.matmul(min_encodings.float(), self.embedding.weight)
+
+        if shape is not None:
+            z_q = z_q.view(shape)
+
+            # reshape back to match original input shape
+            z_q = z_q.permute(0, 3, 1, 2).contiguous()
+
+        return z_q
+
+
 class GumbelQuantize(nn.Module):
     """
     credit to @karpathy: https://github.com/karpathy/deep-vector-quantization/blob/main/model.py (thanks!)
@@ -443,3 +685,11 @@ class EMAVectorQuantizer(nn.Module):
         #z_q, 'b h w c -> b c h w'
         z_q = rearrange(z_q, 'b h w c -> b c h w')
         return z_q, loss, (perplexity, encodings, encoding_indices)
+
+
+if __name__ == '__main__':
+
+    quantizer = LoopyVectorQuantizer(10, 5, beta=0.25)
+
+    a = torch.randn((3, 5)).uniform_(-1.0 / 10, 1.0 / 10)
+    quantizer(a)
